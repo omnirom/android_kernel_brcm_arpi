@@ -18,6 +18,7 @@
 #include <linux/of_device.h>
 #include <linux/regmap.h>
 #include <linux/rtc.h>
+//#include "rtc-core.h"
 
 #define RV3028_SEC			0x00
 #define RV3028_MIN			0x01
@@ -65,6 +66,7 @@
 
 #define RV3028_EVT_CTRL_TSR		BIT(2)
 
+#define RV3028_EEPROM_CMD_REFRESH	0x12
 #define RV3028_EEPROM_CMD_WRITE		0x21
 #define RV3028_EEPROM_CMD_READ		0x22
 
@@ -73,7 +75,7 @@
 
 #define RV3028_BACKUP_TCE		BIT(5)
 #define RV3028_BACKUP_TCR_MASK		GENMASK(1,0)
-#define RV3028_BACKUP_BSM_MASK		0x0C
+#define RV3028_BACKUP_BSM_MASK		GENMASK(3,2)
 
 #define OFFSET_STEP_PPT			953674
 
@@ -582,6 +584,58 @@ restore_eerd:
 	return ret;
 }
 
+static int rv3028_ram_refresh(void *priv)
+{
+	u32 status, ctrl1;
+	int ret, err;
+
+	ret = regmap_read(priv, RV3028_CTRL1, &ctrl1);
+	if (ret)
+		return ret;
+
+	if (!(ctrl1 & RV3028_CTRL1_EERD)) {
+		ret = regmap_update_bits(priv, RV3028_CTRL1,
+					 RV3028_CTRL1_EERD, RV3028_CTRL1_EERD);
+		if (ret)
+			return ret;
+
+		ret = regmap_read_poll_timeout(priv, RV3028_STATUS, status,
+					       !(status & RV3028_STATUS_EEBUSY),
+					       RV3028_EEBUSY_POLL,
+					       RV3028_EEBUSY_TIMEOUT);
+		if (ret)
+			goto restore_eerd;
+	}
+
+	ret = regmap_write(priv, RV3028_EEPROM_CMD, 0x0);
+	if (ret)
+		goto restore_eerd;
+
+	ret = regmap_write(priv, RV3028_EEPROM_CMD,
+			   RV3028_EEPROM_CMD_REFRESH);
+	if (ret)
+		goto restore_eerd;
+
+	usleep_range(RV3028_EEBUSY_POLL, RV3028_EEBUSY_TIMEOUT);
+
+	ret = regmap_read_poll_timeout(priv, RV3028_STATUS, status,
+				       !(status & RV3028_STATUS_EEBUSY),
+				       RV3028_EEBUSY_POLL,
+				       RV3028_EEBUSY_TIMEOUT);
+	if (ret)
+		goto restore_eerd;
+
+restore_eerd:
+	if (!(ctrl1 & RV3028_CTRL1_EERD)) {
+		err = regmap_update_bits(priv, RV3028_CTRL1, RV3028_CTRL1_EERD,
+					 0);
+		if (err && !ret)
+			ret = err;
+	}
+
+	return ret;
+}
+
 static struct rtc_class_ops rv3028_rtc_ops = {
 	.read_time = rv3028_get_time,
 	.set_time = rv3028_set_time,
@@ -601,7 +655,8 @@ static int rv3028_probe(struct i2c_client *client)
 	struct rv3028_data *rv3028;
 	int ret, status;
 	u32 ohms;
-	u8 bsm;
+	u32 bsm;
+	u8 backup, backup_bits, backup_mask;
 	struct nvmem_config nvmem_cfg = {
 		.name = "rv3028_nvram",
 		.word_size = 1,
@@ -673,16 +728,17 @@ static int rv3028_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
-	/* setup backup switchover mode */
-	if (!device_property_read_u8(&client->dev, "backup-switchover-mode",
-				     &bsm))  {
-		if (bsm <= 3) {
-			ret = regmap_update_bits(rv3028->regmap, RV3028_BACKUP,
-				RV3028_BACKUP_BSM_MASK,
-				(bsm & 0x03) << 2);
+	backup_bits = 0;
+	backup_mask = 0;
 
-			if (ret)
-				return ret;
+	/* setup backup switchover mode */
+	dev_dbg(&client->dev, "Checking RTC backup switchover-mode\n");
+	if (!device_property_read_u32(&client->dev,
+				      "backup-switchover-mode",
+				      &bsm)) {
+		if (bsm <= 3) {
+			backup_bits |= (u8)(bsm << 2);
+			backup_mask |= RV3028_BACKUP_BSM_MASK;
 		} else {
 			dev_warn(&client->dev, "invalid backup switchover mode value\n");
 		}
@@ -698,15 +754,41 @@ static int rv3028_probe(struct i2c_client *client)
 				break;
 
 		if (i < ARRAY_SIZE(rv3028_trickle_resistors)) {
-			ret = regmap_update_bits(rv3028->regmap, RV3028_BACKUP,
-						 RV3028_BACKUP_TCE |
-						 RV3028_BACKUP_TCR_MASK,
-						 RV3028_BACKUP_TCE | i);
-			if (ret)
-				return ret;
+			backup_bits |= RV3028_BACKUP_TCE | i;
+			backup_mask |= RV3028_BACKUP_TCE |
+				RV3028_BACKUP_TCR_MASK;
 		} else {
-			dev_warn(&client->dev, "invalid trickle resistor value\n");
+			dev_warn(&client->dev,
+				 "invalid trickle resistor value\n");
 		}
+	}
+
+	if (backup_mask) {
+		ret = rv3028_eeprom_read((void *)(rv3028->regmap),
+					 RV3028_BACKUP,
+					 (void *)&backup, 1);
+		if (!ret) {
+			/* Write EEPROM only if needed */
+			if ((backup & backup_mask) != backup_bits) {
+				backup = (backup & ~backup_mask) | backup_bits;
+				dev_dbg(&client->dev,
+					"Backup register doesn't match: EEPROM write required\n");
+				ret = rv3028_eeprom_write(
+					(void *)(rv3028->regmap),
+					RV3028_BACKUP, (void *)&backup, 1);
+
+				if (!ret)
+					ret = rv3028_ram_refresh((void *)(rv3028->regmap));
+			}
+		}
+
+		/* In the event of an EEPROM failure, update the register
+		   instead. */
+		if (ret)
+			ret = regmap_update_bits(rv3028->regmap, RV3028_BACKUP,
+						 backup_mask, backup_bits);
+		if (ret)
+			return ret;
 	}
 
 	ret = rtc_add_group(rv3028->rtc, &rv3028_attr_group);

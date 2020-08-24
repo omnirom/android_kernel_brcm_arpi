@@ -12,6 +12,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
 #include <linux/blkpg.h>
 #include <linux/bio.h>
@@ -142,6 +143,7 @@ EXPORT_SYMBOL_GPL(dm_bio_get_target_bio_nr);
 #define DMF_NOFLUSH_SUSPENDING 5
 #define DMF_DEFERRED_REMOVE 6
 #define DMF_SUSPENDED_INTERNALLY 7
+#define DMF_POST_SUSPENDING 8
 
 #define DM_NUMA_NODE NUMA_NO_NODE
 static int dm_numa_node = DM_NUMA_NODE;
@@ -1309,6 +1311,7 @@ static int clone_bio(struct dm_target_io *tio, struct bio *bio,
 
 	if (bio_integrity(bio)) {
 		int r;
+
 		if (unlikely(!dm_target_has_integrity(tio->ti->type) &&
 			     !dm_target_passes_integrity(tio->ti->type))) {
 			DMWARN("%s: the target %s doesn't support integrity data.",
@@ -1417,9 +1420,6 @@ static int __send_empty_flush(struct clone_info *ci)
 	BUG_ON(bio_has_data(ci->bio));
 	while ((ti = dm_table_get_target(ci->map, target_nr++)))
 		__send_duplicate_bios(ci, ti, ti->num_flush_bios, NULL);
-
-	bio_disassociate_blkg(ci->bio);
-
 	return 0;
 }
 
@@ -1607,6 +1607,7 @@ static blk_qc_t __split_and_process_bio(struct mapped_device *md,
 		ci.bio = &flush_bio;
 		ci.sector_count = 0;
 		error = __send_empty_flush(&ci);
+		bio_uninit(ci.bio);
 		/* dec_pending submits any data associated with flush */
 	} else if (bio_op(bio) == REQ_OP_ZONE_RESET) {
 		ci.bio = bio;
@@ -1681,6 +1682,7 @@ static blk_qc_t __process_bio(struct mapped_device *md, struct dm_table *map,
 		ci.bio = &flush_bio;
 		ci.sector_count = 0;
 		error = __send_empty_flush(&ci);
+		bio_uninit(ci.bio);
 		/* dec_pending submits any data associated with flush */
 	} else {
 		struct dm_target_io *tio;
@@ -2260,7 +2262,7 @@ static int dm_keyslot_evict_callback(struct dm_target *ti, struct dm_dev *dev,
 	struct dm_keyslot_evict_args *args = data;
 	int err;
 
-	err = blk_crypto_evict_key(dev->bdev->bd_queue, args->key);
+	err = blk_crypto_evict_key(bdev_get_queue(dev->bdev), args->key);
 	if (!args->err)
 		args->err = err;
 	/* Always try to evict the key from all devices. */
@@ -2271,10 +2273,10 @@ static int dm_keyslot_evict_callback(struct dm_target *ti, struct dm_dev *dev,
  * When an inline encryption key is evicted from a device-mapper device, evict
  * it from all the underlying devices.
  */
-static int dm_keyslot_evict(struct keyslot_manager *ksm,
+static int dm_keyslot_evict(struct blk_keyslot_manager *ksm,
 			    const struct blk_crypto_key *key, unsigned int slot)
 {
-	struct mapped_device *md = keyslot_manager_private(ksm);
+	struct mapped_device *md = container_of(ksm, struct mapped_device, ksm);
 	struct dm_keyslot_evict_args args = { key };
 	struct dm_table *t;
 	int srcu_idx;
@@ -2307,7 +2309,7 @@ static int dm_derive_raw_secret_callback(struct dm_target *ti,
 					 sector_t len, void *data)
 {
 	struct dm_derive_raw_secret_args *args = data;
-	struct request_queue *q = dev->bdev->bd_queue;
+	struct request_queue *q = bdev_get_queue(dev->bdev);
 
 	if (!args->err)
 		return 0;
@@ -2317,10 +2319,10 @@ static int dm_derive_raw_secret_callback(struct dm_target *ti,
 		return 0;
 	}
 
-	args->err = keyslot_manager_derive_raw_secret(q->ksm, args->wrapped_key,
-						args->wrapped_key_size,
-						args->secret,
-						args->secret_size);
+	args->err = blk_ksm_derive_raw_secret(q->ksm, args->wrapped_key,
+					      args->wrapped_key_size,
+					      args->secret,
+					      args->secret_size);
 	/* Try another device in case this fails. */
 	return 0;
 }
@@ -2330,12 +2332,12 @@ static int dm_derive_raw_secret_callback(struct dm_target *ti,
  * only only one raw_secret can exist for a particular wrappedkey,
  * retrieve it only from the first device that supports derive_raw_secret()
  */
-static int dm_derive_raw_secret(struct keyslot_manager *ksm,
+static int dm_derive_raw_secret(struct blk_keyslot_manager *ksm,
 				const u8 *wrapped_key,
 				unsigned int wrapped_key_size,
 				u8 *secret, unsigned int secret_size)
 {
-	struct mapped_device *md = keyslot_manager_private(ksm);
+	struct mapped_device *md = container_of(ksm, struct mapped_device, ksm);
 	struct dm_derive_raw_secret_args args = {
 		.wrapped_key = wrapped_key,
 		.wrapped_key_size = wrapped_key_size,
@@ -2364,43 +2366,38 @@ static int dm_derive_raw_secret(struct keyslot_manager *ksm,
 	return args.err;
 }
 
-static struct keyslot_mgmt_ll_ops dm_ksm_ll_ops = {
+static struct blk_ksm_ll_ops dm_ksm_ll_ops = {
 	.keyslot_evict = dm_keyslot_evict,
 	.derive_raw_secret = dm_derive_raw_secret,
 };
 
-static int dm_init_inline_encryption(struct mapped_device *md)
+static void dm_init_inline_encryption(struct mapped_device *md)
 {
-	unsigned int features;
-	unsigned int mode_masks[BLK_ENCRYPTION_MODE_MAX];
+	blk_ksm_init_passthrough(&md->ksm);
+	md->ksm.ksm_ll_ops = dm_ksm_ll_ops;
 
 	/*
-	 * Initially declare support for all crypto settings.  Anything
+	 * Initially declare support for all crypto settings. Anything
 	 * unsupported by a child device will be removed later when calculating
 	 * the device restrictions.
 	 */
-	features = BLK_CRYPTO_FEATURE_STANDARD_KEYS |
-		   BLK_CRYPTO_FEATURE_WRAPPED_KEYS;
-	memset(mode_masks, 0xFF, sizeof(mode_masks));
+	md->ksm.max_dun_bytes_supported = UINT_MAX;
+	md->ksm.features = BLK_CRYPTO_FEATURE_STANDARD_KEYS |
+			   BLK_CRYPTO_FEATURE_WRAPPED_KEYS;
+	memset(md->ksm.crypto_modes_supported, 0xFF,
+	       sizeof(md->ksm.crypto_modes_supported));
 
-	md->queue->ksm = keyslot_manager_create_passthrough(NULL,
-							    &dm_ksm_ll_ops,
-							    features,
-							    mode_masks, md);
-	if (!md->queue->ksm)
-		return -ENOMEM;
-	return 0;
+	blk_ksm_register(&md->ksm, md->queue);
 }
 
 static void dm_destroy_inline_encryption(struct request_queue *q)
 {
-	keyslot_manager_destroy(q->ksm);
-	q->ksm = NULL;
+	blk_ksm_destroy(q->ksm);
+	blk_ksm_unregister(q);
 }
 #else /* CONFIG_BLK_INLINE_ENCRYPTION */
-static inline int dm_init_inline_encryption(struct mapped_device *md)
+static inline void dm_init_inline_encryption(struct mapped_device *md)
 {
-	return 0;
 }
 
 static inline void dm_destroy_inline_encryption(struct request_queue *q)
@@ -2448,11 +2445,7 @@ int dm_setup_md_queue(struct mapped_device *md, struct dm_table *t)
 		return r;
 	}
 
-	r = dm_init_inline_encryption(md);
-	if (r) {
-		DMERR("Cannot initialize inline encryption");
-		return r;
-	}
+	dm_init_inline_encryption(md);
 
 	dm_table_set_restrictions(t, md->queue, &limits);
 	blk_register_queue(md->disk);
@@ -2542,6 +2535,7 @@ static void __dm_destroy(struct mapped_device *md, bool wait)
 	if (!dm_suspended_md(md)) {
 		dm_table_presuspend_targets(map);
 		set_bit(DMF_SUSPENDED, &md->flags);
+		set_bit(DMF_POST_SUSPENDING, &md->flags);
 		dm_table_postsuspend_targets(map);
 	}
 	/* dm_put_live_table must be before msleep, otherwise deadlock is possible */
@@ -2864,7 +2858,9 @@ retry:
 	if (r)
 		goto out_unlock;
 
+	set_bit(DMF_POST_SUSPENDING, &md->flags);
 	dm_table_postsuspend_targets(map);
+	clear_bit(DMF_POST_SUSPENDING, &md->flags);
 
 out_unlock:
 	mutex_unlock(&md->suspend_lock);
@@ -2961,7 +2957,9 @@ static void __dm_internal_suspend(struct mapped_device *md, unsigned suspend_fla
 	(void) __dm_suspend(md, map, suspend_flags, TASK_UNINTERRUPTIBLE,
 			    DMF_SUSPENDED_INTERNALLY);
 
+	set_bit(DMF_POST_SUSPENDING, &md->flags);
 	dm_table_postsuspend_targets(map);
+	clear_bit(DMF_POST_SUSPENDING, &md->flags);
 }
 
 static void __dm_internal_resume(struct mapped_device *md)
@@ -3038,17 +3036,25 @@ EXPORT_SYMBOL_GPL(dm_internal_resume_fast);
 int dm_kobject_uevent(struct mapped_device *md, enum kobject_action action,
 		       unsigned cookie)
 {
+	int r;
+	unsigned noio_flag;
 	char udev_cookie[DM_COOKIE_LENGTH];
 	char *envp[] = { udev_cookie, NULL };
 
+	noio_flag = memalloc_noio_save();
+
 	if (!cookie)
-		return kobject_uevent(&disk_to_dev(md->disk)->kobj, action);
+		r = kobject_uevent(&disk_to_dev(md->disk)->kobj, action);
 	else {
 		snprintf(udev_cookie, DM_COOKIE_LENGTH, "%s=%u",
 			 DM_COOKIE_ENV_VAR_NAME, cookie);
-		return kobject_uevent_env(&disk_to_dev(md->disk)->kobj,
-					  action, envp);
+		r = kobject_uevent_env(&disk_to_dev(md->disk)->kobj,
+				       action, envp);
 	}
+
+	memalloc_noio_restore(noio_flag);
+
+	return r;
 }
 
 uint32_t dm_next_uevent_seq(struct mapped_device *md)
@@ -3114,6 +3120,11 @@ int dm_suspended_md(struct mapped_device *md)
 	return test_bit(DMF_SUSPENDED, &md->flags);
 }
 
+static int dm_post_suspending_md(struct mapped_device *md)
+{
+	return test_bit(DMF_POST_SUSPENDING, &md->flags);
+}
+
 int dm_suspended_internally_md(struct mapped_device *md)
 {
 	return test_bit(DMF_SUSPENDED_INTERNALLY, &md->flags);
@@ -3129,6 +3140,12 @@ int dm_suspended(struct dm_target *ti)
 	return dm_suspended_md(dm_table_get_md(ti->table));
 }
 EXPORT_SYMBOL_GPL(dm_suspended);
+
+int dm_post_suspending(struct dm_target *ti)
+{
+	return dm_post_suspending_md(dm_table_get_md(ti->table));
+}
+EXPORT_SYMBOL_GPL(dm_post_suspending);
 
 int dm_noflush_suspending(struct dm_target *ti)
 {

@@ -157,17 +157,20 @@ static inline unsigned get_max_io_size(struct request_queue *q,
 	return sectors & (lbs - 1);
 }
 
-static unsigned get_max_segment_size(const struct request_queue *q,
-				     unsigned offset)
+static inline unsigned get_max_segment_size(const struct request_queue *q,
+					    struct page *start_page,
+					    unsigned long offset)
 {
 	unsigned long mask = queue_segment_boundary(q);
 
-	/* default segment boundary mask means no boundary limit */
-	if (mask == BLK_SEG_BOUNDARY_MASK)
-		return queue_max_segment_size(q);
+	offset = mask & (page_to_phys(start_page) + offset);
 
-	return min_t(unsigned long, mask - (mask & offset) + 1,
-		     queue_max_segment_size(q));
+	/*
+	 * overflow may be triggered in case of zero page physical address
+	 * on 32bit arch, use queue's max segment size when that happens.
+	 */
+	return min_not_zero(mask - offset + 1,
+			(unsigned long)queue_max_segment_size(q));
 }
 
 /**
@@ -201,7 +204,8 @@ static bool bvec_split_segs(const struct request_queue *q,
 	unsigned seg_size = 0;
 
 	while (len && *nsegs < max_segs) {
-		seg_size = get_max_segment_size(q, bv->bv_offset + total_len);
+		seg_size = get_max_segment_size(q, bv->bv_page,
+						bv->bv_offset + total_len);
 		seg_size = min(seg_size, len);
 
 		(*nsegs)++;
@@ -404,7 +408,8 @@ static unsigned blk_bvec_map_sg(struct request_queue *q,
 
 	while (nbytes > 0) {
 		unsigned offset = bvec->bv_offset + total;
-		unsigned len = min(get_max_segment_size(q, offset), nbytes);
+		unsigned len = min(get_max_segment_size(q, bvec->bv_page,
+					offset), nbytes);
 		struct page *page = bvec->bv_page;
 
 		/*
@@ -576,13 +581,13 @@ int ll_back_merge_fn(struct request *req, struct bio *bio, unsigned int nr_segs)
 	if (blk_integrity_rq(req) &&
 	    integrity_req_gap_back_merge(req, bio))
 		return 0;
+	if (!bio_crypt_ctx_back_mergeable(req, bio))
+		return 0;
 	if (blk_rq_sectors(req) + bio_sectors(bio) >
 	    blk_rq_get_max_sectors(req, blk_rq_pos(req))) {
 		req_set_nomerge(req->q, req);
 		return 0;
 	}
-	if (!bio_crypt_ctx_mergeable(req->bio, blk_rq_bytes(req), bio))
-		return 0;
 
 	return ll_new_hw_segment(req, bio, nr_segs);
 }
@@ -594,13 +599,13 @@ int ll_front_merge_fn(struct request *req, struct bio *bio, unsigned int nr_segs
 	if (blk_integrity_rq(req) &&
 	    integrity_req_gap_front_merge(req, bio))
 		return 0;
+	if (!bio_crypt_ctx_front_mergeable(req, bio))
+		return 0;
 	if (blk_rq_sectors(req) + bio_sectors(bio) >
 	    blk_rq_get_max_sectors(req, bio->bi_iter.bi_sector)) {
 		req_set_nomerge(req->q, req);
 		return 0;
 	}
-	if (!bio_crypt_ctx_mergeable(bio, bio->bi_iter.bi_size, req->bio))
-		return 0;
 
 	return ll_new_hw_segment(req, bio, nr_segs);
 }
@@ -645,7 +650,7 @@ static int ll_merge_requests_fn(struct request_queue *q, struct request *req,
 	if (blk_integrity_merge_rq(q, req, next) == false)
 		return 0;
 
-	if (!bio_crypt_ctx_mergeable(req->bio, blk_rq_bytes(req), next->bio))
+	if (!bio_crypt_ctx_merge_rq(req, next))
 		return 0;
 
 	/* Merge is OK... */
@@ -872,6 +877,10 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 	if (blk_integrity_merge_bio(rq->q, rq, bio) == false)
 		return false;
 
+	/* Only merge if the crypt contexts are compatible */
+	if (!bio_crypt_rq_ctx_compatible(rq, bio))
+		return false;
+
 	/* must be using the same buffer */
 	if (req_op(rq) == REQ_OP_WRITE_SAME &&
 	    !blk_write_same_mergeable(rq->bio, bio))
@@ -885,10 +894,6 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 		return false;
 
 	if (rq->ioprio != bio_prio(bio))
-		return false;
-
-	/* Only merge if the crypt contexts are compatible */
-	if (!bio_crypt_ctx_compatible(bio, rq->bio))
 		return false;
 
 	return true;

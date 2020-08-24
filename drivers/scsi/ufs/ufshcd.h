@@ -57,6 +57,7 @@
 #include <linux/regulator/consumer.h>
 #include <linux/bitfield.h>
 #include <linux/devfreq.h>
+#include <linux/keyslot-manager.h>
 #include "unipro.h"
 
 #include <asm/irq.h>
@@ -119,6 +120,7 @@ enum uic_link_state {
 	UIC_LINK_OFF_STATE	= 0, /* Link powered down or disabled */
 	UIC_LINK_ACTIVE_STATE	= 1, /* Link is in Fast/Slow/Sleep state */
 	UIC_LINK_HIBERN8_STATE	= 2, /* Link is in Hibernate state */
+	UIC_LINK_BROKEN_STATE	= 3, /* Link is in broken state */
 };
 
 #define ufshcd_is_link_off(hba) ((hba)->uic_link_state == UIC_LINK_OFF_STATE)
@@ -126,11 +128,15 @@ enum uic_link_state {
 				    UIC_LINK_ACTIVE_STATE)
 #define ufshcd_is_link_hibern8(hba) ((hba)->uic_link_state == \
 				    UIC_LINK_HIBERN8_STATE)
+#define ufshcd_is_link_broken(hba) ((hba)->uic_link_state == \
+				   UIC_LINK_BROKEN_STATE)
 #define ufshcd_set_link_off(hba) ((hba)->uic_link_state = UIC_LINK_OFF_STATE)
 #define ufshcd_set_link_active(hba) ((hba)->uic_link_state = \
 				    UIC_LINK_ACTIVE_STATE)
 #define ufshcd_set_link_hibern8(hba) ((hba)->uic_link_state = \
 				    UIC_LINK_HIBERN8_STATE)
+#define ufshcd_set_link_broken(hba) ((hba)->uic_link_state = \
+				    UIC_LINK_BROKEN_STATE)
 
 #define ufshcd_set_ufs_dev_active(h) \
 	((h)->curr_dev_pwr_mode = UFS_ACTIVE_PWR_MODE)
@@ -184,8 +190,7 @@ struct ufs_pm_lvl_states {
  * @intr_cmd: Interrupt command (doesn't participate in interrupt aggregation)
  * @issue_time_stamp: time stamp for debug purposes
  * @compl_time_stamp: time stamp for statistics
- * @crypto_enable: whether or not the request needs inline crypto operations
- * @crypto_key_slot: the key slot to use for inline crypto
+ * @crypto_key_slot: the key slot to use for inline crypto (-1 if none)
  * @data_unit_num: the data unit number for the first block for inline crypto
  * @req_abort_skip: skip request abort task flag
  */
@@ -211,11 +216,10 @@ struct ufshcd_lrb {
 	bool intr_cmd;
 	ktime_t issue_time_stamp;
 	ktime_t compl_time_stamp;
-#if IS_ENABLED(CONFIG_SCSI_UFS_CRYPTO)
-	bool crypto_enable;
-	u8 crypto_key_slot;
+#ifdef CONFIG_SCSI_UFS_CRYPTO
+	int crypto_key_slot;
 	u64 data_unit_num;
-#endif /* CONFIG_SCSI_UFS_CRYPTO */
+#endif
 
 	bool req_abort_skip;
 };
@@ -297,8 +301,6 @@ struct ufs_pwr_mode_info {
 	struct ufs_pa_layer_attr info;
 };
 
-union ufs_crypto_cfg_entry;
-
 /**
  * struct ufs_hba_variant_ops - variant specific callbacks
  * @name: variant name
@@ -326,7 +328,7 @@ union ufs_crypto_cfg_entry;
  * @dbg_register_dump: used to dump controller debug information
  * @phy_initialization: used to initialize phys
  * @device_reset: called to issue a reset pulse on the UFS device
- * @program_key: program an inline encryption key into a keyslot
+ * @program_key: program or evict an inline encryption key
  */
 struct ufs_hba_variant_ops {
 	const char *name;
@@ -357,39 +359,11 @@ struct ufs_hba_variant_ops {
 	void	(*dbg_register_dump)(struct ufs_hba *hba);
 	int	(*phy_initialization)(struct ufs_hba *);
 	void	(*device_reset)(struct ufs_hba *hba);
-	int	(*program_key)(struct ufs_hba *hba,
-			       const union ufs_crypto_cfg_entry *cfg, int slot);
 	void	(*config_scaling_param)(struct ufs_hba *hba,
 					struct devfreq_dev_profile *profile,
 					void *data);
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
-};
-
-struct keyslot_mgmt_ll_ops;
-struct ufs_hba_crypto_variant_ops {
-	void (*setup_rq_keyslot_manager)(struct ufs_hba *hba,
-					 struct request_queue *q);
-	void (*destroy_rq_keyslot_manager)(struct ufs_hba *hba,
-					   struct request_queue *q);
-	int (*hba_init_crypto)(struct ufs_hba *hba,
-			       const struct keyslot_mgmt_ll_ops *ksm_ops);
-	void (*enable)(struct ufs_hba *hba);
-	void (*disable)(struct ufs_hba *hba);
-	int (*suspend)(struct ufs_hba *hba, enum ufs_pm_op pm_op);
-	int (*resume)(struct ufs_hba *hba, enum ufs_pm_op pm_op);
-	int (*debug)(struct ufs_hba *hba);
-	int (*prepare_lrbp_crypto)(struct ufs_hba *hba,
-				   struct scsi_cmnd *cmd,
-				   struct ufshcd_lrb *lrbp);
-	int (*map_sg_crypto)(struct ufs_hba *hba, struct ufshcd_lrb *lrbp);
-	int (*complete_lrbp_crypto)(struct ufs_hba *hba,
-				    struct scsi_cmnd *cmd,
-				    struct ufshcd_lrb *lrbp);
-	void *priv;
+	int	(*program_key)(struct ufs_hba *hba,
+			       const union ufs_crypto_cfg_entry *cfg, int slot);
 
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
@@ -487,6 +461,8 @@ struct ufs_err_reg_hist {
 
 /**
  * struct ufs_stats - keeps usage/err statistics
+ * @last_intr_status: record the last interrupt status.
+ * @last_intr_ts: record the last interrupt timestamp.
  * @hibern8_exit_cnt: Counter to keep track of number of exits,
  *		reset this after link-startup.
  * @last_hibern8_exit_tstamp: Set time after the hibern8 exit.
@@ -506,6 +482,9 @@ struct ufs_err_reg_hist {
  * @tsk_abort: tracks task abort events
  */
 struct ufs_stats {
+	u32 last_intr_status;
+	ktime_t last_intr_ts;
+
 	u32 hibern8_exit_cnt;
 	ktime_t last_hibern8_exit_tstamp;
 
@@ -571,12 +550,14 @@ struct ufs_hba_variant_params {
  * @intr_mask: Interrupt Mask Bits
  * @ee_ctrl_mask: Exception event control mask
  * @is_powered: flag to check if HBA is powered
+ * @eh_wq: Workqueue that eh_work works on
  * @eh_work: Worker to handle UFS errors that require s/w attention
  * @eeh_work: Worker to handle exception events
  * @errors: HBA errors
  * @uic_error: UFS interconnect layer error status
  * @saved_err: sticky error mask
  * @saved_uic_err: sticky UIC error mask
+ * @force_reset: flag to force eh_work perform a full reset
  * @silence_err_logs: flag to silence error logs
  * @dev_cmd: ufs device management command information
  * @last_dme_cmd_tstamp: time stamp of the last completed DME command
@@ -642,7 +623,6 @@ struct ufs_hba {
 	const struct ufs_hba_variant_ops *vops;
 	struct ufs_hba_variant_params *vps;
 	void *priv;
-	const struct ufs_hba_crypto_variant_ops *crypto_vops;
 	size_t sg_entry_size;
 	unsigned int irq;
 	bool is_irq_enabled;
@@ -712,12 +692,6 @@ struct ufs_hba {
 	#define UFSHCI_QUIRK_BROKEN_HCE				0x400
 
 	/*
-	 * This quirk needs to be enabled if the host controller advertises
-	 * inline encryption support but it doesn't work correctly.
-	 */
-	#define UFSHCD_QUIRK_BROKEN_CRYPTO			0x800
-
-	/*
 	 * This quirk needs to be enabled if the host controller reports
 	 * OCS FATAL ERROR with device error through sense data
 	 */
@@ -744,6 +718,7 @@ struct ufs_hba {
 	bool is_powered;
 
 	/* Work Queues */
+	struct workqueue_struct *eh_wq;
 	struct work_struct eh_work;
 	struct work_struct eeh_work;
 
@@ -753,6 +728,7 @@ struct ufs_hba {
 	u32 saved_err;
 	u32 saved_uic_err;
 	struct ufs_stats ufs_stats;
+	bool force_reset;
 	bool silence_err_logs;
 
 	/* Device management request data */
@@ -807,16 +783,16 @@ struct ufs_hba {
 	 */
 #define UFSHCD_CAP_RPM_AUTOSUSPEND (1 << 6)
 	/*
-	 * This capability allows the host controller driver to use the
-	 * inline crypto engine, if it is present
-	 */
-#define UFSHCD_CAP_CRYPTO (1 << 7)
-	/*
 	 * This capability allows the host controller driver to turn-on
 	 * WriteBooster, if the underlying device supports it and is
 	 * provisioned to be used. This would increase the write performance.
 	 */
-#define	UFSHCD_CAP_WB_EN (1 << 8)
+#define UFSHCD_CAP_WB_EN (1 << 7)
+	/*
+	 * This capability allows the host controller driver to use the
+	 * inline crypto engine, if it is present
+	 */
+#define UFSHCD_CAP_CRYPTO (1 << 8)
 
 	struct devfreq *devfreq;
 	struct ufs_clk_scaling clk_scaling;
@@ -832,17 +808,17 @@ struct ufs_hba {
 	struct device		bsg_dev;
 	struct request_queue	*bsg_queue;
 
-#ifdef CONFIG_SCSI_UFS_CRYPTO
-	/* crypto */
-	union ufs_crypto_capabilities crypto_capabilities;
-	union ufs_crypto_cap_entry *crypto_cap_array;
-	u32 crypto_cfg_register;
-	struct keyslot_manager *ksm;
-#endif /* CONFIG_SCSI_UFS_CRYPTO */
-
 	bool wb_buf_flush_enabled;
 	bool wb_enabled;
 	struct delayed_work rpm_dev_flush_recheck_work;
+
+#ifdef CONFIG_SCSI_UFS_CRYPTO
+	union ufs_crypto_capabilities crypto_capabilities;
+	union ufs_crypto_cap_entry *crypto_cap_array;
+	u32 crypto_cfg_register;
+	struct blk_keyslot_manager ksm;
+#endif
+
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);

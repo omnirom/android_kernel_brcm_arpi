@@ -143,6 +143,7 @@
 #include <linux/net_namespace.h>
 #include <linux/indirect_call_wrapper.h>
 #include <net/devlink.h>
+#include <trace/hooks/net.h>
 
 #include "net-sysfs.h"
 
@@ -302,6 +303,12 @@ EXPORT_PER_CPU_SYMBOL(softnet_data);
 
 static inline struct list_head *ptype_head(const struct packet_type *pt)
 {
+	struct list_head vendor_pt = { .next  = NULL, };
+
+	trace_android_vh_ptype_head(pt, &vendor_pt);
+	if (vendor_pt.next)
+		return vendor_pt.next;
+
 	if (pt->type == htons(ETH_P_ALL))
 		return pt->dev ? &pt->dev->ptype_all : &ptype_all;
 	else
@@ -5229,7 +5236,7 @@ static void flush_backlog(struct work_struct *work)
 	skb_queue_walk_safe(&sd->input_pkt_queue, skb, tmp) {
 		if (skb->dev->reg_state == NETREG_UNREGISTERING) {
 			__skb_unlink(skb, &sd->input_pkt_queue);
-			kfree_skb(skb);
+			dev_kfree_skb_irq(skb);
 			input_queue_head_incr(sd);
 		}
 	}

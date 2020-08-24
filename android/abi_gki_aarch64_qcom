@@ -990,8 +990,6 @@
   idr_preload
   idr_remove
   idr_replace
-  ieee80211_frequency_to_channel
-  ieee80211_get_channel
   ieee80211_hdrlen
   iio_channel_get
   iio_channel_release
@@ -1116,8 +1114,6 @@
   kernfs_find_and_get_ns
   kernfs_notify
   kernfs_put
-  keyslot_manager_create
-  keyslot_manager_private
   __kfifo_in
   __kfifo_out
   kfree
