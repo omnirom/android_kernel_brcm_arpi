@@ -1,0 +1,38 @@
+// rpi-tv HAT
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "raspberrypi,4-model-b", "brcm,bcm2711";
+	fragment@0 {
+		target-path = "/";
+		__overlay__ {
+            firmware: firmware {
+                android {
+                    compatible = "android,firmware";
+
+                    fstab {
+                        compatible = "android,fstab";
+                        vendor {
+                            compatible = "android,vendor";
+                            dev = "/dev/block/mmcblk0p3";
+                            type = "ext4";
+                            mnt_flags = "ro,barrier=1";
+                            fsmgr_flags = "wait,first_stage_mount";
+                            status = "ok";
+                        };
+                        system {
+                            compatible = "android,system";
+                            dev = "/dev/block/mmcblk0p2";
+                            type = "ext4";
+                            mnt_flags = "ro,barrier=1";
+                            fsmgr_flags = "wait,first_stage_mount";
+                            status = "ok";
+                        };
+                    };
+                };
+            };
+        };
+    };
+};
