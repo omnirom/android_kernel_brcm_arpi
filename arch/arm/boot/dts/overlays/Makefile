@@ -153,6 +153,8 @@ dtbo-$(CONFIG_ARCH_BCM2835) += \
 	rpi-proto.dtbo \
 	rpi-sense.dtbo \
 	rpi-tv.dtbo \
+	rpi-android-sdcard.dtbo \
+	rpi-android-usb.dtbo \
 	rpivid-v4l2.dtbo \
 	rra-digidac1-wm8741-audio.dtbo \
 	sainsmart18.dtbo \
