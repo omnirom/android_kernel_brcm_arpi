@@ -134,7 +134,7 @@ Params:
                                 6=Alt                    7=Speed/Flash
                                 8=Link                   9=Activity
 
-        eth_led1                Set mode of LED1 - green on Pi3B (default "6"),
+        eth_led1                Set mode of LED1 - green on Pi3B+ (default "6"),
                                 amber on Pi4 (default "8"). See eth_led0 for
                                 legal values.
 
@@ -259,6 +259,14 @@ Params: activelow               Set to "on" to invert the sense of the LED
                                 (in case you want to connect it to an external
                                 device)
                                 REQUIRED
+
+
+Name:   adafruit18
+Info:   Overlay for the SPI-connected Adafruit 1.8" display (based on the
+        ST7735R chip). It includes support for the "green tab" version.
+Load:   dtoverlay=adafruit18,<param>=<val>
+Params: green                   Use the adafruit18_green variant.
+        rotate                  Display rotation {0,90,180,270}
 
 
 Name:   adau1977-adc
@@ -2251,6 +2259,13 @@ Load:   dtoverlay=rra-digidac1-wm8741-audio
 Params: <None>
 
 
+Name:   sainsmart18
+Info:   Overlay for the SPI-connected Sainsmart 1.8" display (based on the
+        ST7735R chip).
+Load:   dtoverlay=sainsmart18,<param>=<val>
+Params: rotate                  Display rotation {0,90,180,270}
+
+
 Name:   sc16is750-i2c
 Info:   Overlay for the NXP SC16IS750 UART with I2C Interface
         Enables the chip on I2C1 at 0x48 (or the "addr" parameter value). To
@@ -2412,11 +2427,27 @@ Load:   dtoverlay=spi-rtc,<param>=<val>
 Params: pcf2123                 Select the PCF2123 device
 
 
-Name:   spi0-cs
-Info:   Allows the (software) CS pins for SPI0 to be changed
-Load:   dtoverlay=spi0-cs,<param>=<val>
+Name:   spi0-1cs
+Info:   Only use one CS pin for SPI0
+Load:   dtoverlay=spi0-1cs,<param>=<val>
+Params: cs0_pin                 GPIO pin for CS0 (default 8)
+        no_miso                 Don't claim and use the MISO pin (9), freeing
+                                it for other uses.
+
+
+Name:   spi0-2cs
+Info:   Change the CS pins for SPI0
+Load:   dtoverlay=spi0-2cs,<param>=<val>
 Params: cs0_pin                 GPIO pin for CS0 (default 8)
         cs1_pin                 GPIO pin for CS1 (default 7)
+        no_miso                 Don't claim and use the MISO pin (9), freeing
+                                it for other uses.
+
+
+Name:   spi0-cs
+Info:   This overlay has been renamed spi0-2cs, keeping spi0-cs as an
+        alias for backwards compatibility.
+Load:   <Deprecated>
 
 
 Name:   spi0-hw-cs
