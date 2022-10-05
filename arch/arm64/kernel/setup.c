@@ -300,9 +300,12 @@ static void add_androidboot_params(char *cmdline)
 {
 	struct device_node *np;
 	const char *serial;
+	const char *model;
 
 	char params[100];
 	char btaddr[20];
+	char modelId[25];
+
 	strcpy(params, " androidboot.serialno=10000000abcd1234");
 	strcat(params, " androidboot.btmacaddr=");
 	strcpy(btaddr, "11:22:33:44:55:66");
@@ -319,6 +322,16 @@ static void add_androidboot_params(char *cmdline)
 			strncpy(btaddr+12, serial+12, 2);
 			strncpy(btaddr+15, serial+14, 2);
 			strcat(params, btaddr);
+		}
+		if (!of_property_read_string(np, "model",
+					     &model)) {
+			if (strstr(model, "Compute Module 4")) {
+				sprintf(modelId, " androidboot.model=cm4");
+				strcat(params, modelId);
+			} else if (strstr(model, "4 Model B")) {
+				sprintf(modelId, " androidboot.model=pi4");
+				strcat(params, modelId);
+			}
 		}
 		of_node_put(np);
 	}
